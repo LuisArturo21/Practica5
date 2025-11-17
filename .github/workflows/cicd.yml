@@ -1,0 +1,120 @@
+name: CI/CD Pipeline para App AWS
+
+on:
+  push:
+    branches: [ main ] # Asegúrese que su rama se llame 'main'
+
+jobs:
+  #
+  # --- Actividad 3: Etapa de Build ---
+  #
+  build:
+    name: 1. Build y Pruebas
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout del código
+        uses: actions/checkout@v3
+
+      - name: Configurar Python 3.9
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.9'
+
+      - name: Instalar dependencias
+        run: |
+          pip install -r requirements.txt
+          echo "Build exitoso."
+
+  #
+  # --- Actividad 4: Etapa de Docker (Distribución) ---
+  #
+  distribute:
+    name: 2. Build y Push a ECR
+    needs: build 
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout del código
+        uses: actions/checkout@v3
+
+      - name: Configurar credenciales de AWS
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Login a Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v1
+
+      - name: Build, Tag y Push de la imagen a ECR
+        id: build-image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY_NAME }}
+          IMAGE_TAG: ${{ github.sha }} 
+        run: |
+          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+          echo "::set-output name=image_name::$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+    
+    outputs:
+      image: ${{ steps.build-image.outputs.image_name }}
+
+  #
+  # --- Actividad 5: Etapa de Deploy (Ejecución) ---
+  #
+  deploy:
+    name: 3. Deploy a EC2
+    needs: distribute 
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Configurar llave SSH para EC2
+        run: |
+          mkdir -p ~/.ssh/
+          echo "${{ secrets.EC2_SSH_KEY }}" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+          ssh-keyscan -H "${{ secrets.ECR_REGISTRY }}" >> ~/.ssh/known_hosts
+          ssh-keyscan -H "${{ secrets.EC2_HOST }}" >> ~/.ssh/known_hosts
+
+      - name: Desplegar en EC2
+        env:
+          HOST: ${{ secrets.EC2_HOST }}
+          USER: ${{ secrets.EC2_USER }}
+          IMAGE_NAME: ${{ needs.distribute.outputs.image }}
+          
+          APP_FLASK_ENV: prod
+          APP_TABLE_NAME: perros_prod
+          APP_AWS_REGION: ${{ secrets.AWS_REGION }}
+          
+          ECR_REGISTRY_HOST: ${{ secrets.ECR_REGISTRY }}
+          
+        run: |
+          echo "Desplegando imagen $IMAGE_NAME en $USER@$HOST"
+          ssh -i ~/.ssh/id_rsa $USER@$HOST << 'EOF'
+            
+            # 1. Loguear Docker a ECR (Usa el LabInstanceProfile de la EC2)
+            aws ecr get-login-password --region $APP_AWS_REGION | docker login --username AWS --password-stdin $ECR_REGISTRY_HOST
+            
+            # 2. Hacer pull de la nueva imagen
+            docker pull $IMAGE_NAME
+            
+            # 3. Detener y eliminar el contenedor anterior (si existe)
+            docker stop mi-app-crud || true
+            docker rm mi-app-crud || true
+            
+            # 4. Ejecutar el nuevo contenedor con las variables de 'prod'
+            docker run -d --name mi-app-crud \
+              -p 80:5000 \
+              -e FLASK_ENV=$APP_FLASK_ENV \
+              -e DYNAMODB_TABLE=$APP_TABLE_NAME \
+              -e AWS_REGION=$APP_AWS_REGION \
+              $IMAGE_NAME
+              
+            echo "Despliegue completado."
+            docker image prune -f
+          EOF
